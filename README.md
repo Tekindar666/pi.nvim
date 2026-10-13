@@ -91,7 +91,7 @@ npm run test:harpoon         # requires Harpoon 2 and plenary
 
 Set `NVIM_PLUGIN_DIR` for the Harpoon test if plugins are not in Neovim's `data/lazy` directory. Tests isolate editor processes and Harpoon data; they do not overwrite personal marks or contact a model. The integration test uses real Neovim and real sockets with a simulated Pi editor/API and substituted tmux discovery.
 
-The development dependency pins the tested Pi runtime. Consumers use their host Pi's bundled imports; there are no bundled Pi runtime dependencies and no npm publication.
+The development dependency pins the tested Pi runtime. Consumers use their host Pi's bundled imports; there are no bundled Pi runtime dependencies and no npm publication. Dependency lifecycle scripts are disabled: Pi does not need them. Both npm and pnpm installation are supported; pnpm wrappers may install development dependencies too.
 
 ## Origin
 
