@@ -1,0 +1,17 @@
+-- Core setup works with only pi.nvim on the runtime path and no tmux session.
+vim.opt.runtimepath:append(vim.fn.getcwd())
+vim.env.TMUX_PANE = nil
+local pi = require("pi")
+pi.setup()
+pi.setup()
+assert(pi.status() == "Pi ○")
+assert(package.loaded["harpoon"] == nil)
+assert(package.loaded["plenary.path"] == nil)
+assert(package.loaded["lualine"] == nil)
+assert(package.loaded["noice"] == nil)
+assert(vim.fn.maparg("\\pa", "n") == "")
+pi.prompt()
+assert(vim.bo.filetype == "markdown")
+assert(vim.wo.winhighlight == "Normal:Normal,FloatBorder:FloatBorder")
+assert(package.loaded["noice"] == nil)
+print("Standalone setup and prompt checks passed")
