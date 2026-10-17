@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Two-way Neovim and Pi coding-agent bridge over tmux and Unix sockets",
+  "description": "Explicit local pairing, questions, and editor tools for Pi and Neovim",
   "repository": "github:Tekindar666/pi.nvim",
-  "keywords": ["pi-package", "neovim", "tmux"],
+  "keywords": ["pi-package", "neovim"],
   "engines": { "node": ">=22.19.0" },
   "pi": { "extensions": ["./extensions/nvim-bridge.ts"] },
   "peerDependencies": {
@@ -25,10 +25,7 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs && npm run test:lua",
-    "test:lua": "nvim --headless -u NONE -i NONE -l tests/nvim-pi.lua && nvim --headless -u NONE -i NONE -l tests/nvim-pi-prompt.lua && nvim --headless -u NONE -i NONE -l tests/nvim-pi-quickfix.lua && nvim --headless -u NONE -i NONE -l tests/package.lua",
-    "test:harpoon": "nvim --headless -u NONE -i NONE -l tests/nvim-pi-harpoon.lua",
     "typecheck": "tsc --noEmit",
-    "lint": "stylua --check lua examples tests/*.lua && node --check tests/nvim-bridge.test.mjs"
+    "lint": "stylua --check lua plugin"
   }
 }

@@ -7,13 +7,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { chmod, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
-import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
-const TMUX_OPTION = "@pi_nvim_bridge";
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 5000;
 
@@ -36,7 +34,7 @@ type EditorContext = {
 };
 
 type RegisterMessage = {
-  version: 1;
+  version: 2;
   type: "register";
   projectRoot?: string;
   nvimServer?: string;
@@ -44,13 +42,13 @@ type RegisterMessage = {
 };
 
 type SubmitMessage = {
-  version: 1;
+  version: 2;
   type: "submit";
   id: string;
 };
 
 type DraftMessage = {
-  version: 1;
+  version: 2;
   type: "draft";
   id: string;
   label: string;
@@ -59,7 +57,7 @@ type DraftMessage = {
 };
 
 type ResponseMessage = {
-  version: 1;
+  version: 2;
   type: "response";
   id: string;
   ok: boolean;
@@ -83,7 +81,9 @@ type Peer = {
   nvimServer?: string;
   tmuxPane?: string;
   lastContext?: EditorContext;
+  draftContext?: EditorContext;
   pending: Map<string, PendingRequest>;
+  closing: boolean;
 };
 
 type ReadBufferResult = {
@@ -111,7 +111,9 @@ function isPosition(value: unknown): value is Position {
 
 function parseMessage(line: string): IncomingMessage {
   const value = JSON.parse(line) as Record<string, unknown>;
-  if (value.version !== 1) throw new Error("Unsupported bridge protocol version");
+  if (!value || typeof value !== "object" || value.version !== 2) {
+    throw new Error("Incompatible bridge protocol; update both Pi and Neovim to version 2");
+  }
   if (value.type === "register") return value as RegisterMessage;
   if (value.type === "response") {
     if (typeof value.id !== "string" || typeof value.ok !== "boolean") {
@@ -131,6 +133,9 @@ function parseMessage(line: string): IncomingMessage {
 
   const context = value.context as EditorContext | undefined;
   if (!context || typeof context !== "object") throw new Error("Draft context is required");
+  if (typeof context.file !== "string" || !isAbsolute(context.file)) {
+    throw new Error("Draft context requires an absolute source file path");
+  }
   if (context.cursor !== undefined && !isPosition(context.cursor)) {
     throw new Error("Invalid cursor position");
   }
@@ -160,7 +165,49 @@ function formatDraft(label: string, content: string | undefined, context: Editor
   return draft;
 }
 
-async function removeSocket(path: string): Promise<void> {
+/** Refuse unsafe shared locations rather than changing permissions on someone else's directory. */
+async function registryDirectory(): Promise<string> {
+  if (!process.getuid) throw new Error("The Neovim bridge requires a Unix user ID");
+  const uid = process.getuid();
+  const directory = `/tmp/pi-nvim-${uid}`;
+  try {
+    await mkdir(directory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const stat = await lstat(directory);
+  if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o700) {
+    throw new Error(`Unsafe Neovim bridge registry: ${directory}; expected an owned directory with mode 0700`);
+  }
+  return directory;
+}
+
+/** A complete advertisement becomes visible only after the socket is ready. */
+async function advertise(directory: string, instanceId: string, socketPath: string, cwd: string): Promise<string> {
+  const path = join(directory, `${instanceId}.json`);
+  const temporaryPath = `${path}.tmp`;
+  const file = await open(temporaryPath, "wx", 0o600);
+  try {
+    try {
+      await file.writeFile(`${JSON.stringify({
+        version: 1,
+        protocolVersion: 2,
+        instanceId,
+        pid: process.pid,
+        cwd,
+        socketPath,
+      })}\n`);
+    } finally {
+      await file.close();
+    }
+    await rename(temporaryPath, path);
+    return path;
+  } finally {
+    await removeFile(temporaryPath);
+  }
+}
+
+async function removeFile(path: string): Promise<void> {
   try {
     await unlink(path);
   } catch (error) {
@@ -204,9 +251,9 @@ function rejectPending(peer: Peer, reason: string): void {
 export default function (pi: ExtensionAPI) {
   let server: Server | undefined;
   let socketPath: string | undefined;
-  let tmuxPane: string | undefined;
-  let lastPeer: Peer | undefined;
-  let activePromptPeer: Peer | undefined;
+  let advertisementPath: string | undefined;
+  // Only a successful registration owns routing; advertisements never confer ownership.
+  let pairedPeer: Peer | undefined;
   let activeContext: ExtensionContext | undefined;
   const peers = new Set<Peer>();
 
@@ -216,7 +263,7 @@ export default function (pi: ExtensionAPI) {
     params: object,
     signal?: AbortSignal,
   ): Promise<unknown> => {
-    if (peer.socket.destroyed) throw new Error("The Neovim connection is closed");
+    if (peer.closing || peer.socket.destroyed) throw new Error("The Neovim connection is closed");
     if (signal?.aborted) throw new Error(`Neovim ${method} request aborted`);
 
     const id = randomUUID();
@@ -240,25 +287,36 @@ export default function (pi: ExtensionAPI) {
       }
 
       peer.pending.set(id, { resolve: resolveRequest, reject, timer, removeAbortListener });
-      send(peer.socket, { version: 1, type: "request", id, method, params });
+      send(peer.socket, { version: 2, type: "request", id, method, params });
     });
   };
 
+  const requireDraftEditor = () => {
+    if (!activeContext?.hasUI || ("mode" in activeContext && activeContext.mode !== "tui")) {
+      throw new Error("Drafting and submission require Pi's interactive terminal editor");
+    }
+    return activeContext;
+  };
+
   const setDraftText = (text: string) => {
-    if (!activeContext?.hasUI) throw new Error("Pi editor is unavailable");
-    activeContext.ui.setEditorText(text);
+    const context = requireDraftEditor();
+    context.ui.setEditorText(text);
     // setEditorText currently mutates state without requesting a TUI render.
-    activeContext.ui.setStatus("nvim-bridge", "nvim bridge");
+    context.ui.setStatus("nvim-bridge", "nvim bridge");
   };
 
   const handleMessage = (peer: Peer, message: IncomingMessage) => {
     if (message.type === "register") {
+      if (pairedPeer) throw new Error("Pi is already paired; disconnect the current editor first");
       peer.projectRoot = message.projectRoot;
       peer.nvimServer = message.nvimServer;
       peer.tmuxPane = message.tmuxPane;
-      lastPeer = peer;
+      pairedPeer = peer;
+      send(peer.socket, { version: 2, type: "registered", ok: true });
       return;
     }
+
+    if (pairedPeer !== peer) throw new Error("Register before sending bridge messages");
 
     if (message.type === "response") {
       const pending = peer.pending.get(message.id);
@@ -271,31 +329,31 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    lastPeer = peer;
     try {
       if (message.type === "draft") {
-        peer.lastContext = message.context;
         const block = formatDraft(message.label, message.content, message.context);
-        const current = activeContext?.ui.getEditorText() ?? "";
+        const current = requireDraftEditor().ui.getEditorText();
         const draft = current.trim() === "" ? block : `${current}\n\n${block}`;
         setDraftText(draft);
-        send(peer.socket, { version: 1, type: "response", id: message.id, ok: true, result: { draft } });
+        peer.draftContext = message.context;
+        send(peer.socket, { version: 2, type: "response", id: message.id, ok: true, result: { appended: true } });
         return;
       }
 
-      if (!activeContext?.hasUI) throw new Error("Pi editor is unavailable");
-      const draft = activeContext.ui.getEditorText();
+      const draft = requireDraftEditor().ui.getEditorText();
       const submitted = draft.trim() !== "";
       if (submitted) {
-        activePromptPeer = peer;
         pi.sendUserMessage(draft, { deliverAs: "followUp" });
+        // Preparing the next question must not change the source of the last submitted one.
+        peer.lastContext = peer.draftContext;
+        peer.draftContext = undefined;
         setDraftText("");
       }
-      send(peer.socket, { version: 1, type: "response", id: message.id, ok: true, result: { submitted } });
+      send(peer.socket, { version: 2, type: "response", id: message.id, ok: true, result: { submitted } });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       send(peer.socket, {
-        version: 1,
+        version: 2,
         type: "response",
         id: message.id,
         ok: false,
@@ -306,10 +364,14 @@ export default function (pi: ExtensionAPI) {
 
   const handleConnection = (socket: Socket) => {
     socket.setEncoding("utf8");
-    const peer: Peer = { socket, buffer: "", pending: new Map() };
+    const peer: Peer = { socket, buffer: "", pending: new Map(), closing: false };
     peers.add(peer);
+    const registrationTimer = setTimeout(() => {
+      if (pairedPeer !== peer) socket.destroy();
+    }, REQUEST_TIMEOUT_MS);
 
     socket.on("data", (chunk: string) => {
+      if (peer.closing) return;
       peer.buffer += chunk;
       if (Buffer.byteLength(peer.buffer) > MAX_REQUEST_BYTES) {
         socket.destroy(new Error("Bridge message exceeds 1MB"));
@@ -325,18 +387,24 @@ export default function (pi: ExtensionAPI) {
 
         try {
           handleMessage(peer, parseMessage(line));
+          if (pairedPeer === peer) clearTimeout(registrationTimer);
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
-          socket.destroy(new Error(detail));
+          peer.closing = true;
+          // Flush the rejection before closing; ignore any further pipelined messages.
+          socket.end(
+            `${JSON.stringify({ version: 2, type: "registered", ok: false, error: detail })}\n`,
+            () => socket.destroy(),
+          );
           return;
         }
       }
     });
 
     socket.on("close", () => {
+      clearTimeout(registrationTimer);
       peers.delete(peer);
-      if (lastPeer === peer) lastPeer = undefined;
-      if (activePromptPeer === peer) activePromptPeer = undefined;
+      if (pairedPeer === peer) pairedPeer = undefined;
       rejectPending(peer, "Neovim disconnected");
     });
     socket.on("error", () => {});
@@ -346,22 +414,22 @@ export default function (pi: ExtensionAPI) {
     name: "nvim_read_buffer",
     label: "Read Neovim Buffer",
     description:
-      "Read live contents from the Neovim buffer that initiated the latest prompt. Use this instead of read when the buffer may contain unsaved changes. Output is limited to 2000 lines or 50KB; use offset and limit to paginate.",
+      "Read live contents from a named Neovim buffer. Without a path, use the source of the latest question submitted through PiSubmit, not the current cursor buffer. Use this instead of read when the buffer may contain unsaved changes. Output is limited to 2000 lines or 50KB; use offset and limit to paginate.",
     promptSnippet: "Read live, potentially unsaved contents from the connected Neovim buffer",
     promptGuidelines: [
       "Use nvim_read_buffer instead of read when Neovim context includes a changedtick and unsaved editor content may matter.",
     ],
     parameters: Type.Object({
-      path: Type.Optional(Type.String({ description: "File path; defaults to the prompt's Neovim buffer" })),
+      path: Type.Optional(Type.String({ description: "File path; defaults to the source of the latest PiSubmit question" })),
       offset: Type.Optional(Type.Integer({ minimum: 1, description: "First line to read (1-based)" })),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const peer = lastPeer;
-      if (!peer) throw new Error("No Neovim instance has sent a prompt to this Pi session");
+      const peer = pairedPeer;
+      if (!peer) throw new Error("No Neovim instance is paired with this Pi session");
 
       let path = params.path?.replace(/^@/, "") || peer.lastContext?.file;
-      if (!path) throw new Error("No Neovim buffer path is available");
+      if (!path) throw new Error("Specify a file path or submit a Neovim question with PiSubmit first");
       if (!isAbsolute(path)) path = resolve(ctx.cwd, path);
 
       const result = (await requestPeer(
@@ -377,7 +445,8 @@ export default function (pi: ExtensionAPI) {
         maxBytes: DEFAULT_MAX_BYTES,
       });
       const lastLine = result.offset + result.lines.length - 1;
-      let text = `${result.file}:${result.offset}-${lastLine}`;
+      let text = result.file;
+      if (result.lines.length > 0) text += `:${result.offset}-${lastLine}`;
       text += ` (${result.totalLines} lines, changedtick ${result.changedtick}`;
       if (result.modified) text += ", modified";
       text += `)\n${truncation.content}`;
@@ -419,8 +488,8 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const peer = lastPeer;
-      if (!peer) throw new Error("No Neovim instance has sent a prompt to this Pi session");
+      const peer = pairedPeer;
+      if (!peer) throw new Error("No Neovim instance is paired with this Pi session");
 
       const severityTypes = { error: "E", warning: "W", info: "I", note: "N" } as const;
       const items = params.items.map((item) => {
@@ -472,8 +541,8 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const peer = lastPeer;
-      if (!peer) throw new Error("No Neovim instance is connected to this Pi session");
+      const peer = pairedPeer;
+      if (!peer) throw new Error("No Neovim instance is paired with this Pi session");
 
       const paths = params.paths.map((path) => resolve(ctx.cwd, path.replace(/^@/, "")));
       const result = (await requestPeer(
@@ -495,83 +564,65 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  const sendAgentState = (state: "working" | "idle") => {
-    const peer = activePromptPeer ?? lastPeer;
-    if (!peer) return;
-    void requestPeer(peer, "set_status", { state }).catch(() => {});
-  };
-
-  pi.on("agent_start", () => {
-    sendAgentState("working");
-  });
-
-  pi.on("agent_settled", () => {
-    sendAgentState("idle");
-    activePromptPeer = undefined;
-  });
-
-  pi.on("session_start", async (_event, ctx) => {
-    activeContext = ctx;
-    tmuxPane = process.env.TMUX_PANE;
-    if (!tmuxPane) {
-      ctx.ui.notify("Neovim bridge requires Pi to run inside tmux", "warning");
-      return;
-    }
-
-    socketPath = join(tmpdir(), `pi-nvim-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
-    await removeSocket(socketPath);
-
-    server = createServer(handleConnection);
-    await listen(server, socketPath);
-    await chmod(socketPath, 0o600);
-
-    const result = await pi.exec("tmux", [
-      "set-option",
-      "-w",
-      "-t",
-      tmuxPane,
-      TMUX_OPTION,
-      socketPath,
-    ]);
-    if (result.code !== 0) {
-      await closeServer(server);
-      await removeSocket(socketPath);
-      server = undefined;
-      throw new Error(`Failed to register Neovim bridge with tmux: ${result.stderr.trim()}`);
-    }
-
-    ctx.ui.setStatus("nvim-bridge", "nvim bridge");
-  });
-
-  pi.on("session_shutdown", async (_event, ctx) => {
-    ctx.ui.setStatus("nvim-bridge", undefined);
-
-    if (tmuxPane && socketPath) {
-      const current = await pi.exec("tmux", [
-        "show-options",
-        "-w",
-        "-v",
-        "-t",
-        tmuxPane,
-        TMUX_OPTION,
-      ]);
-      if (current.code === 0 && current.stdout.trim() === socketPath) {
-        await pi.exec("tmux", ["set-option", "-w", "-u", "-t", tmuxPane, TMUX_OPTION]);
+  const stopBridge = async () => {
+    const errors: unknown[] = [];
+    // Withdraw discovery first, but a failed unlink must not prevent socket cleanup.
+    if (advertisementPath) {
+      try {
+        await removeFile(advertisementPath);
+        advertisementPath = undefined;
+      } catch (error) {
+        errors.push(error);
       }
     }
-
     for (const peer of peers) {
       rejectPending(peer, "Pi session shut down");
       peer.socket.destroy();
     }
     peers.clear();
-    lastPeer = undefined;
-    activePromptPeer = undefined;
+    pairedPeer = undefined;
     activeContext = undefined;
 
-    if (server) await closeServer(server);
-    if (socketPath) await removeSocket(socketPath);
+    if (server?.listening) await closeServer(server);
     server = undefined;
-    socketPath = undefined;
+    if (socketPath) {
+      try {
+        await removeFile(socketPath);
+        socketPath = undefined;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, "Failed to clean up Neovim bridge files");
+  };
+
+  pi.on("session_start", async (_event, ctx) => {
+    // Repeated lifecycle events must not leave an older listener or advertisement behind.
+    ctx.ui.setStatus("nvim-bridge", undefined);
+    await stopBridge();
+    activeContext = ctx;
+    try {
+      const directory = await registryDirectory();
+      const instanceId = randomUUID();
+      const path = join(directory, `${instanceId}.sock`);
+      server = createServer(handleConnection);
+      await listen(server, path);
+      socketPath = path;
+      await chmod(path, 0o600);
+      advertisementPath = await advertise(directory, instanceId, path, ctx.cwd);
+      ctx.ui.setStatus("nvim-bridge", "nvim bridge");
+    } catch (error) {
+      try {
+        await stopBridge();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "Neovim bridge startup and cleanup failed");
+      }
+      throw error;
+    }
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    ctx.ui.setStatus("nvim-bridge", undefined);
+    await stopBridge();
   });
 }

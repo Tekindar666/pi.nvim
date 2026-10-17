@@ -1,139 +1,119 @@
 local M = {}
-local draft = nil
+local buffer, context
+local pending = false
 
-local function text(state)
-  return table.concat(vim.api.nvim_buf_get_lines(state.buffer, 0, -1, false), "\n")
+local function notify(message, level)
+  vim.notify(message, level or vim.log.levels.INFO, { title = "Pi" })
 end
 
-local function visible(state)
-  return state.window
-    and vim.api.nvim_win_is_valid(state.window)
-    and vim.api.nvim_win_get_buf(state.window) == state.buffer
+local function text()
+  if not buffer or not vim.api.nvim_buf_is_valid(buffer) then
+    return ""
+  end
+  return table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n")
 end
 
-local function close(state)
-  if visible(state) then
-    state.cursor = vim.api.nvim_win_get_cursor(state.window)
-    if vim.api.nvim_get_current_win() == state.window then
-      vim.cmd("stopinsert")
-    end
-    vim.api.nvim_win_close(state.window, true)
-  end
-end
-
-local function confirm(state)
-  if state.pending then
-    return
-  end
-  local content = text(state)
-  if vim.trim(content) == "" then
-    return
-  end
-
-  -- Freeze the submitted text until acknowledgement; a late reply must never erase new edits.
-  state.pending = true
-  vim.bo[state.buffer].modifiable = false
-  local done = vim.schedule_wrap(function(ok)
-    if not state.pending then
+--- Reopen an existing question without replacing its source. Only a fresh question captures new context.
+function M.open(range)
+  local source = vim.api.nvim_get_current_buf()
+  if text():match("^%s*$") and not pending and source ~= buffer then
+    local ok, captured = pcall(require("pi.context").capture, range)
+    if not ok then
+      notify(tostring(captured), vim.log.levels.ERROR)
       return
     end
-    state.pending = false
-    if not vim.api.nvim_buf_is_valid(state.buffer) then
+    context = captured
+  end
+  if not context then
+    notify("Open a named file buffer before composing a Pi question", vim.log.levels.WARN)
+    return
+  end
+  if not buffer or not vim.api.nvim_buf_is_valid(buffer) then
+    buffer = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(buffer, "pi://question")
+    vim.bo[buffer].bufhidden = "hide"
+    vim.bo[buffer].filetype = "markdown"
+    vim.bo[buffer].swapfile = false
+    vim.keymap.set("n", "q", "<cmd>hide<CR>", { buffer = buffer, desc = "Hide Pi question (retain text)" })
+    vim.keymap.set({ "n", "i" }, "<C-s>", function()
+      M.send()
+    end, { buffer = buffer, desc = "Send question to Pi and close on acceptance" })
+  end
+  local window = vim.fn.bufwinid(buffer)
+  if window ~= -1 then
+    vim.api.nvim_set_current_win(window)
+  else
+    vim.cmd("botright 10split")
+    vim.api.nvim_win_set_buf(0, buffer)
+  end
+  notify("Question source: " .. vim.fn.strtrans(context.file) .. ". Ctrl-S sends; :PiDraft appends for review.")
+end
+
+function M.busy()
+  return pending
+end
+
+local function deliver(submit)
+  if pending or require("pi.commands").busy() then
+    notify("Wait for the pending draft or submission to complete", vim.log.levels.WARN)
+    return
+  end
+  local content = text()
+  if not context or content:match("^%s*$") then
+    notify("Write a question with :PiPrompt first", vim.log.levels.WARN)
+    return
+  end
+  local source_buffer = buffer
+  local window = vim.fn.bufwinid(buffer)
+  local origin = vim.fn.bufnr(context.file)
+  local tick = vim.api.nvim_buf_get_changedtick(buffer)
+  pending = true
+  local send = require("pi").draft
+  if submit then
+    send = require("pi").send_question
+  end
+  send(content, context, function(ok, result)
+    pending = false
+    if not ok then
+      notify(tostring(result) .. " Question kept locally.", vim.log.levels.ERROR)
       return
     end
-    vim.bo[state.buffer].modifiable = true
-    if ok then
-      close(state)
-      vim.api.nvim_buf_delete(state.buffer, { force = true })
-      if draft == state then
-        draft = nil
+    if not submit and (type(result) ~= "table" or result.appended ~= true) then
+      notify("Invalid draft reply. Question kept locally; check Pi before retrying.", vim.log.levels.ERROR)
+      return
+    end
+    if vim.api.nvim_buf_is_valid(source_buffer) and vim.api.nvim_buf_get_changedtick(source_buffer) == tick then
+      vim.api.nvim_buf_set_lines(source_buffer, 0, -1, false, { "" })
+      vim.bo[source_buffer].modified = false
+      if submit then
+        -- Close only the original composer window, never a window the user repurposed.
+        if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == source_buffer then
+          if vim.api.nvim_get_current_win() == window then
+            vim.cmd.stopinsert()
+          end
+          local closed = pcall(vim.api.nvim_win_close, window, false)
+          if not closed and vim.api.nvim_buf_is_loaded(origin) then
+            -- Neovim cannot close its last window; show the existing source buffer instead.
+            vim.api.nvim_win_set_buf(window, origin)
+          end
+        end
+        notify("Question submitted to Pi")
+      else
+        notify("Appended to Pi draft. Review it in Pi, then :PiSubmit.")
       end
+    else
+      local action = submit and "Submitted" or "Appended"
+      notify(action .. " snapshot to Pi; newer local edits kept. Review before sending again.", vim.log.levels.WARN)
     end
   end)
-
-  local ok, error = pcall(state.on_confirm, content, state.context, done)
-  if not ok then
-    done(false)
-    vim.notify(tostring(error), vim.log.levels.ERROR, { title = "Pi" })
-  end
 end
 
-local function create(context, on_confirm)
-  local state = {
-    buffer = vim.api.nvim_create_buf(false, true),
-    context = context,
-    on_confirm = on_confirm,
-    pending = false,
-  }
-  vim.bo[state.buffer].bufhidden = "hide"
-  vim.bo[state.buffer].swapfile = false
-  vim.bo[state.buffer].undofile = false
-  vim.bo[state.buffer].filetype = "markdown"
-  vim.b[state.buffer].completion = false
-
-  -- Keep confirmation local to the composer, independent of global save mappings.
-  vim.keymap.set({ "n", "i" }, "<C-s>", function()
-    confirm(state)
-  end, { buffer = state.buffer, desc = "Add Prompt to Pi Draft" })
-  vim.keymap.set("n", "q", function()
-    close(state)
-  end, { buffer = state.buffer, desc = "Close Pi Prompt (Keep Text)" })
-  -- Keep these editing keys independent of global completion/escape mappings.
-  vim.keymap.set("i", "<CR>", "<CR>", { buffer = state.buffer })
-  vim.keymap.set("i", "<Esc>", "<Esc>", { buffer = state.buffer })
-  return state
+function M.append()
+  deliver(false)
 end
 
---- Open or resume one in-memory prompt, retaining its original source context and undo history.
---- on_confirm(content, context, done) must call done(true) only after Pi acknowledges the append.
---- Closing never sends or discards text. Empty closed drafts acquire fresh context on the next open.
-function M.open(context, on_confirm)
-  if draft and vim.api.nvim_buf_is_valid(draft.buffer) then
-    if visible(draft) then
-      vim.api.nvim_set_current_win(draft.window)
-      if not draft.pending then
-        vim.cmd("startinsert")
-      end
-      return
-    end
-    if not draft.pending and vim.trim(text(draft)) == "" then
-      vim.api.nvim_buf_delete(draft.buffer, { force = true })
-      draft = nil
-    end
-  else
-    draft = nil
-  end
-  draft = draft or create(context, on_confirm)
-
-  local title = " Pi prompt (text only) "
-  if draft.context.selection then
-    local selection = draft.context.selection
-    local name = draft.context.file and vim.fn.fnamemodify(draft.context.file, ":t") or "[unnamed]"
-    title = string.format(" Pi: %s:%d-%d ", name, selection.start.line, selection["end"].line)
-  end
-  local width = math.max(1, math.min(80, vim.o.columns - 4))
-  local height = math.max(1, math.min(8, vim.o.lines - 4))
-  local options = vim.lsp.util.make_floating_popup_options(width, height, {
-    border = "rounded",
-    focusable = true,
-    title = title,
-  })
-  -- A one-line source split can leave the LSP helper with zero available rows.
-  options.height = math.max(1, options.height)
-  options.footer = " C-s: add to draft | q: close "
-  options.footer_pos = "center"
-  draft.window = vim.api.nvim_open_win(draft.buffer, true, options)
-  vim.wo[draft.window].winhighlight = "Normal:Normal,FloatBorder:FloatBorder"
-  vim.wo[draft.window].wrap = true
-  vim.wo[draft.window].linebreak = true
-  vim.wo[draft.window].conceallevel = 0
-  vim.wo[draft.window].spell = false
-  if draft.cursor then
-    vim.api.nvim_win_set_cursor(draft.window, draft.cursor)
-  end
-  if not draft.pending then
-    vim.cmd("startinsert")
-  end
+function M.send()
+  deliver(true)
 end
 
 return M
