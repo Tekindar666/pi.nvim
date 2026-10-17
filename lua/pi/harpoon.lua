@@ -4,23 +4,19 @@ local function canonical(path)
   return vim.uv.fs_realpath(path) or vim.fs.normalize(path)
 end
 
+--- Replace only marks tagged by Pi. Personal items retain their original slots and context.
 function M.publish(params)
-  if type(params) ~= "table" or type(params.cwd) ~= "string" or params.cwd == "" then
-    error("publish_harpoon requires Pi's working directory")
-  end
   local root = vim.uv.cwd()
-  if canonical(params.cwd) ~= canonical(root) then
-    error("Pi and Neovim must use the same working directory before publishing Harpoon marks")
+  if type(params.cwd) ~= "string" or canonical(params.cwd) ~= canonical(root) then
+    error("Pi and Neovim must use the same working directory for Harpoon publishing")
   end
   if not vim.islist(params.paths) or #params.paths > 20 then
-    error("publish_harpoon requires a list of at most 20 paths; use an empty list to clear Pi marks")
+    error("publish_harpoon requires at most 20 paths")
   end
-
-  local paths = {}
-  local seen = {}
+  local paths, seen = {}, {}
   for _, path in ipairs(params.paths) do
     if type(path) ~= "string" or path:sub(1, 1) ~= "/" or path:find("[\r\n%z]") then
-      error("Every Harpoon path must be an absolute file path without line breaks")
+      error("Harpoon requires absolute file paths without line breaks")
     end
     path = canonical(path)
     local stat = vim.uv.fs_stat(path)
@@ -32,22 +28,25 @@ function M.publish(params)
     end
     if not seen[path] then
       seen[path] = true
-      table.insert(paths, path)
+      paths[#paths + 1] = path
     end
   end
 
-  local harpoon = require("harpoon")
-  if harpoon.ui.win_id and vim.api.nvim_win_is_valid(harpoon.ui.win_id) then
-    error("Close the Harpoon menu before replacing the working set")
+  local ok, harpoon = pcall(require, "harpoon")
+  if not ok or type(harpoon.list) ~= "function" then
+    error("Harpoon publishing requires Harpoon 2 and plenary.nvim")
   end
-  local list = harpoon:list()
+  if harpoon.ui.win_id and vim.api.nvim_win_is_valid(harpoon.ui.win_id) then
+    error("Close the Harpoon menu before publishing marks")
+  end
   local Path = require("plenary.path")
-  local personal = {}
-  local removed = 0
+  local list = harpoon:list()
+  local personal, removed = {}, 0
   for index = list:length(), 1, -1 do
     local item = list:get(index)
     if item then
       if item.context and item.context.pi_working_set then
+        -- Harpoon 2 removes without shifting later slots.
         list:remove_at(index)
         removed = removed + 1
       else
@@ -55,18 +54,13 @@ function M.publish(params)
       end
     end
   end
-
   local added = 0
   for _, path in ipairs(paths) do
     if not personal[path] then
-      list:add({
-        value = Path:new(path):make_relative(root),
-        context = { row = 1, col = 0, pi_working_set = true },
-      })
+      list:add({ value = Path:new(path):make_relative(root), context = { row = 1, col = 0, pi_working_set = true } })
       added = added + 1
     end
   end
-  -- Ownership survives reconnects/restarts; removal keeps personal shortcut slots intact.
   harpoon:sync()
   return { added = added, removed = removed, shared = #paths - added }
 end
