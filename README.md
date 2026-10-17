@@ -1,98 +1,189 @@
 # pi.nvim
 
-A two-way bridge between [Pi](https://pi.dev) and Neovim. Build a Pi draft from editor context without leaving Neovim; let Pi read unsaved buffers and publish explained code locations back to your editor.
+An explicit, local bridge between [Pi](https://pi.dev) and Neovim: choose a Pi
+instance, compose a question with source context, and let Pi read unsaved buffers
+or publish navigation locations without taking over your editor.
+
+**Development branch:** the old automatic-discovery API has been replaced. There
+is no `setup()`, automatic connection, or automatic reconnection. Update both the
+Neovim client and Pi extension together; this branch uses bridge protocol v2.
 
 ## Requirements
 
-- Neovim 0.11+ (tested with 0.12.5).
-- Pi coding agent (tested with `@earendil-works/pi-coding-agent` 0.84.2).
-- tmux on Linux or macOS, with Pi and Neovim in the **same tmux window**.
-- Node.js 22.19+ for Pi. Windows is not supported by this Unix-socket bridge.
+- Neovim 0.11+ and Node.js 22.19+ on Linux or macOS.
+- Pi and Neovim running on the same machine as the same user. No tmux required.
+- Pi's interactive terminal UI for drafting and submission. Other modes can pair
+  and use editor tools, but cannot supply the reviewable Pi draft editor.
+- Optional: Harpoon 2 and plenary.nvim for Harpoon publishing only.
 
-No LazyVim, Noice, Lualine, or Harpoon dependency is required for core features. Linux is tested; macOS is not yet verified.
+Linux with Neovim 0.12.6 and Pi 1.3.0 has been exercised. macOS is not verified.
+Windows is not supported by this Unix-socket bridge.
 
 ## Install both sides
 
-### Neovim (lazy.nvim)
+For local development, load this checkout with your Neovim plugin manager. For lazy.nvim:
 
 ```lua
 {
-  "Tekindar666/pi.nvim",
+  dir = "/absolute/path/to/pi.nvim",
   lazy = false,
-  config = function()
-    require("pi").setup()
-  end,
 }
 ```
 
-For another plugin manager, add this repository to Neovim's runtime path and call `require("pi").setup()`. Setup starts automatic connection discovery; it does not install global keymaps or change your statusline.
+No setup call is needed. Commands load with the plugin; loading it does not connect.
+No global keymaps are installed.
 
-### Pi
+Start Pi with the companion extension:
 
 ```sh
-pi install git:github.com/Tekindar666/pi.nvim
+pi --extension /absolute/path/to/pi.nvim/extensions/nvim-bridge.ts
 ```
 
-Restart Pi and Neovim after saving your work. If migrating from a local copy of the bridge, remove its extension and Lua modules first so only the package is loaded. Installing only the Neovim plugin is not sufficient.
-
-Pi and lazy.nvim manage separate clones of this repository. Update both sides together. Pi supports pinning a Git tag or commit with `@ref`; lazy.nvim supports `commit` or `tag`.
+Load only one copy of the extension. If migrating from another bridge installation,
+remove its configured extension and old Lua API calls first. Pi and Neovim may load
+separate checkouts; editing one does not update the other.
 
 ## Use
 
-Add your preferred mappings; these are examples, not automatically installed defaults:
+| Command | Action |
+|---|---|
+| `:PiConnect` | Choose a reachable local Pi instance using `vim.ui.select()` |
+| `:PiDisconnect` | Release the connection, cancel a pending connection, or invalidate a pending picker |
+| `:PiPrompt` | Open or reopen a retained question buffer with source-file context |
+| `:'<,'>PiPrompt` | Capture the selected **line range** as question context |
+| `:PiDraft` | Append the question to Pi's draft for review; do not submit |
+| `:PiSubmit` | Submit Pi's current draft explicitly |
+
+1. Start Pi, open a named file in Neovim, and run `:PiConnect`.
+2. Run `:PiPrompt`, optionally with a line range, and write a multiline question.
+3. Press **Ctrl-S** in the question buffer to append and submit. The composer closes
+   after Pi acknowledges submission, not after the model finishes answering.
+4. For review-before-submit instead, use `:PiDraft`, review/edit in Pi, then `:PiSubmit`.
+5. Pi can use `nvim_read_buffer` to inspect the live source, including unsaved edits.
+
+The question buffer is an ordinary scratch split. Normal-mode **q** hides it without
+losing text; `:PiPrompt` reopens it. A retained question keeps its original source,
+not whatever buffer happens to be current later. A fresh question captures new context.
+Unnamed and special buffers cannot be question sources.
+
+`:PiDraft` clears unchanged local text after append acknowledgement and leaves the
+composer open. Ctrl-S waits for both append and submission acknowledgement before
+clearing text and closing its split. If you edited while waiting, the newer text and
+composer remain. Closing the composer does not steal focus from another window;
+if it is Neovim's last window, it shows the loaded source buffer instead.
+
+Errors and uncertain delivery retain the question. There are no automatic retries:
+**after a timeout or disconnect, inspect Pi before resending**, because it may have
+received the request even though Neovim missed the reply. An append can succeed
+while submission fails; do not append the same question again blindly. Drafts are
+held in memory; closing Neovim does not persist the scratch question.
+
+**Ctrl-S and `PiSubmit` send the whole Pi draft**, including any existing text. If Pi is busy, its existing follow-up queue is
+used. An empty draft does nothing. The default buffer for `nvim_read_buffer` is the
+source of the latest question submitted through Ctrl-S or `PiSubmit`; preparing another draft
+or moving the cursor does not change it. If several questions were appended, the
+last appended source is the default. An explicit file path always overrides it.
+Submitting directly from Pi's terminal does not establish a new default source.
+
+## Editor tools
+
+- **`nvim_read_buffer`** reads only loaded buffers, never falls back to disk, and
+  never saves or changes editor focus. Responses are limited to 2000 lines and
+  50KB of text; use offset/limit to paginate. A single line over 50KB returns an
+  explicit error rather than silently returning incomplete content.
+- **`nvim_publish_quickfix`** replaces, appends to, or clears one Pi-owned list.
+  It makes that list current without opening windows or jumping to an item. Other
+  lists remain in Neovim's normal quickfix history, subject to its native capacity.
+  Use `:copen` when you want to view the locations. Pi's list persists across reconnects.
+- **`nvim_publish_harpoon`** replaces only Pi-tagged marks in Harpoon's default list.
+  Personal marks keep their slots and context; shared paths remain personal. Pi
+  and Neovim must have the same working directory, and the Harpoon menu must be
+  closed. Files must exist or have a Neovim buffer. Missing Harpoon affects only
+  this optional tool, not the connection or other editor features.
+
+Quickfix is for agreed walkthroughs and requested findings. Harpoon publishing is
+only for explicit requests; those guidelines are included in the tool descriptions.
+
+## Pairing and discovery
+
+One Neovim instance holds one live or pending connection. One Pi accepts one
+registered editor. Another editor is rejected without replacing the owner. Disconnect
+before switching instances. Process exit or socket closure releases ownership once
+observed by the other endpoint; reconnection is always manual.
+
+Pi publishes advertisements in `/tmp/pi-nvim-<uid>/`. The directory must be owned
+by the current user, non-symlink, and mode `0700`; sockets and advertisements use
+`0600`. Unsafe directories are rejected, never repaired automatically.
+
+The picker validates advertisements and briefly probes sockets **without registering**.
+It lists reachable candidates, not guaranteed available pairings: Pi can be busy
+with another editor or exit while the picker is open. Selection requests pairing;
+only Pi's explicit acceptance counts as success. Cancelling does nothing.
+
+Publication uses an atomic rename after the socket is ready. Normal shutdown
+withdraws the advertisement before closing connections. Crashes can leave stale
+files; discovery ignores unreachable or invalid candidates and does not delete files.
+No background service, polling, heartbeat, or tmux advertisement is used.
+
+These permissions do not isolate the bridge from other processes running as your
+user. Connect only to trusted Pi instances. Source metadata and submitted questions
+become model context; buffer contents can be sent when Pi calls the read tool.
+The plugin itself does not contact an AI provider.
+
+## Manual connection API
+
+For scripting or diagnostics, bypass discovery with an advertised `socketPath`:
 
 ```lua
-local pi = require("pi")
-vim.keymap.set({ "n", "x" }, "<leader>pa", pi.add_context, { desc = "Add Context to Pi Draft" })
-vim.keymap.set({ "n", "x" }, "<leader>pp", pi.prompt, { desc = "Add Prompt to Pi Draft" })
-vim.keymap.set({ "n", "x" }, "<leader>ps", pi.submit, { desc = "Submit Pi Draft" })
-vim.keymap.set({ "n", "x" }, "<leader>pd", pi.add_diagnostics, { desc = "Add Diagnostics to Pi" })
-vim.keymap.set({ "n", "x" }, "<leader>ph", pi.add_hover, { desc = "Add LSP Hover to Pi" })
+require("pi").connect("/tmp/pi-nvim-1000/<instance-id>.sock", function(ok, err)
+  print(ok and "Paired" or err)
+end)
 ```
 
-- `add_context()` appends the current file, cursor/selection and buffer change counter to Pi's draft. It does not copy the whole buffer or start a turn.
-- `prompt()` opens a multiline floating composer with the current source context. **Ctrl-S** appends to Pi's draft; **Esc**, then **q** closes while retaining text. Acknowledged appends clear the composer. Failures retain it; after a timeout, inspect Pi's draft before retrying because the append may already have arrived.
-- `add_diagnostics()` appends diagnostics overlapping the cursor line or selected lines.
-- `add_hover()` appends LSP hover information at the cursor.
-- `submit()` explicitly sends the whole Pi draft. If Pi is working, it queues a follow-up. Empty drafts do nothing.
-- `status()` returns `Pi ○` (disconnected), `Pi ●` (connected/idle), or `Pi ◐` (working). Neovim notifies when work settles.
+Later, disconnect with `require("pi").disconnect()`.
 
-Optional Lualine component:
+`connect(path, callback)` calls back once on Neovim's main loop. Success means Pi
+accepted exclusive pairing, not merely that registration was written. Establishment
+has a five-second deadline. Later disconnect silently releases the connection;
+it does not invoke that callback again. The manual API itself emits no notifications.
+`disconnect()` is safe to repeat and cancels an in-progress connection.
 
-```lua
-{ function() return require("pi").status() end }
-```
+`connection_state()` returns `disconnected`, `connecting`, or `paired`.
+`draft(content, capturedContext, callback)` and `submit(callback)` are asynchronous
+request APIs used by the commands. `send_question(content, capturedContext, callback)`
+chains both steps on the same pairing, failing if that connection changes in between.
+They require an existing pairing and never retry.
+See [architecture and protocol](docs/architecture.md) for the message contracts.
 
-### Tools available to Pi
-
-- **`nvim_read_buffer`** reads live, potentially unsaved buffer contents, with pagination and output truncation. It never saves the buffer.
-- **`nvim_publish_quickfix`** publishes an ordered reading set or requested findings. It owns a separate quickfix list, preserves unrelated lists, and does not open windows or move the cursor. Use `:copen` to view it. Replacing with an empty list clears only the managed list.
-- **`nvim_publish_harpoon`** optionally replaces Pi-owned Harpoon marks while preserving personal marks and shortcut slots. Requires Harpoon's `harpoon2` branch and `plenary.nvim`, matching working directories, and a closed Harpoon menu. Without those plugins, only this tool is unavailable; the rest of the bridge works.
-
-Quickfix is intended for agreed walkthroughs and requested findings. Harpoon publishing is intended only for explicit requests; these guidelines ship with the tools.
-
-## Connection and privacy
-
-Pi publishes a Unix socket path in the tmux window option `@pi_nvim_bridge`; Neovim discovers it every two seconds while disconnected. Messages use the existing version-1 newline-delimited JSON protocol. Requests time out after five seconds and are not automatically retried.
-
-Use **one Pi session per tmux window**: the last session to register owns discovery. Editor tools route to the most recently registered/active editor connection; a single editor per window avoids ambiguity. Reconnection can create a new managed quickfix list; old lists remain in quickfix history. Prompt composer text is in memory only and does not survive exiting Neovim.
-
-The socket is local and owner-readable/writable (`0600`). It is not an isolation boundary against other processes running as your user. The extension has Pi's normal system permissions. Context and text you append become part of the Pi prompt when submitted, so avoid sending secrets. The plugin does not independently contact an AI provider.
-
-## Development
+## Development and verification
 
 ```sh
 npm ci --ignore-scripts
-npm test
 npm run typecheck
 npm run lint                 # requires stylua on PATH
-npm run test:harpoon         # requires Harpoon 2 and plenary
 ```
 
-Set `NVIM_PLUGIN_DIR` for the Harpoon test if plugins are not in Neovim's `data/lazy` directory. Tests isolate editor processes and Harpoon data; they do not overwrite personal marks or contact a model. The integration test uses real Neovim and real sockets with a simulated Pi editor/API and substituted tmux discovery.
+The previous automated test suite was intentionally removed; no replacement test
+files are included. Validation currently uses inline runtime smoke checks and
+manual integration. See [the smoke checklist](docs/smoke.md) for a repeatable demo
+and failure checks.
 
-The development dependency pins the tested Pi runtime. Consumers use their host Pi's bundled imports; there are no bundled Pi runtime dependencies and no npm publication. Dependency lifecycle scripts are disabled: Pi does not need them. Both npm and pnpm installation are supported; pnpm wrappers may install development dependencies too.
+The development dependency still pins Pi 0.84.2. Repository typecheck passes with
+those dependencies installed; an additional isolated typecheck against locally
+installed Pi 1.3.0 also passed. Runtime compatibility with the older development pin
+remains unverified. Lua lint, syntax, and diff checks pass. `npm audit` reports two
+affected packages through Pi's transitive `undici` dependency (one moderate, one high);
+no dependency upgrades or forced audit fixes have been applied.
+Dependency lifecycle scripts are disabled. There are no bundled Pi runtime
+dependencies and no npm publication.
+
+## Scope
+
+No statusline component, completion notifications, automatic reconnection, automatic
+submission, diagnostics/hover helpers, or mandatory picker dependencies. The old
+feature API is not a compatibility target.
 
 ## Origin
 
-Extracted from `Tekindar666/dotfiles` (Neovim client) and the author's Pi configuration (companion extension). Keybindings and personal statusline styling remain outside the plugin.
+Extracted from `Tekindar666/dotfiles` (Neovim client) and the author's Pi configuration
+(companion extension), then refactored around explicit pairing and tmux-free discovery.
