@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Explicit local pairing, questions, and editor tools for Pi and Neovim",
+  "description": "Connect Pi to Neovim for contextual prompts, unsaved buffer reads, and code navigation.",
   "repository": "github:Tekindar666/pi.nvim",
   "keywords": ["pi-package", "neovim"],
   "engines": { "node": ">=22.19.0" },
